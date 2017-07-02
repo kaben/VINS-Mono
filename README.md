@@ -26,6 +26,7 @@ alt="Mobile platform" width="240" height="180" border="10" /></a>
 **Related Papers**
 * **VINS-Mono: A Robust and Versatile Monocular Visual-Inertial State Estimator**, Tong Qin, Peiliang Li, Zhenfei Yang, Shaojie Shen [techincal report](https://github.com/HKUST-Aerial-Robotics/VINS-Mono/blob/master/support_files/paper/tro_technical_report.pdf) 
 * **Autonomous Aerial Navigation Using Monocular Visual-Inertial Fusion**, Yi Lin, Fei Gao, Tong Qin, Wenliang Gao, Tianbo Liu, William Wu, Zhenfei Yang, Shaojie Shen (***JFR*** accepted) [pdf](https://github.com/HKUST-Aerial-Robotics/VINS-Mono/blob/master/support_files/paper/jfr2017yi.pdf)  
+*How to cite this article: Lin Y, Gao F, Qin T, et al. Autonomous aerial navigation using monocular visual-inertial fusion. J Field Robotics. 2017;00:1–29. ht<span>tps://doi.org/10.1002/rob.21732*
 
 *If you use VINS-Mono for your academic research, please cite at least one of our related papers.*
 
