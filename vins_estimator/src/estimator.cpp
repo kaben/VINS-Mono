@@ -590,16 +590,19 @@ void Estimator::double2vector()
 
 bool Estimator::failureDetection()
 {
+    /* I think this means "lost tracking". */
     if (f_manager.last_track_num < 2)
     {
         ROS_INFO(" little feature %d", f_manager.last_track_num);
         return true;
     }
+    /* I think this means the acceleration bias estimate is too large. */
     if (Bas[WINDOW_SIZE].norm() > 2.5)
     {
         ROS_INFO(" big IMU acc bias estimation %f", Bas[WINDOW_SIZE].norm());
         return true;
     }
+    /* I think this means the gyroscope bias estimate is too large. */
     if (Bgs[WINDOW_SIZE].norm() > 1.0)
     {
         ROS_INFO(" big IMU gyr bias estimation %f", Bgs[WINDOW_SIZE].norm());
