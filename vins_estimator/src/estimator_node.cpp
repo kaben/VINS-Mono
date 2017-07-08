@@ -1,3 +1,7 @@
+/* Referenced papers:
+ * - Qin et al; 2017; "Technical Report: VINS-Mono: A Robust and Versatile Monocular Visual-Inertial State Estimator"
+ */
+
 #include <stdio.h>
 #include <queue>
 #include <map>
@@ -40,13 +44,95 @@ std::mutex m_update_visualization;
 std::mutex m_keyframe_buf;
 std::mutex m_retrive_data_buf;
 
+/*
+Most recent timestamp.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+*/
 double latest_time;
+
+/*
+Most recent estimate of body position.
+- In world coordinates.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+- Published to ROS in `void imu_callback()`.
+  - ... Published only if certain conditions are met: state estimation system
+    has good confidence.
+- Note: Not to be confused with a temporary variable of the same name in
+  *vins_estimator/src/estimator.cpp*.
+*/
 Eigen::Vector3d tmp_P;
+
+/*
+Most recent estimate of body orientation.
+- In world coordinates.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+- Published to ROS in `void imu_callback()`.
+  - ... Published only if certain conditions are met: state estimation system
+    has good confidence.
+*/
 Eigen::Quaterniond tmp_Q;
+
+/*
+Most recent estimate of body velocity.
+- In world coordinates.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+- Published to ROS in `void imu_callback()`.
+  - ... Published only if certain conditions are met: state estimation system
+    has good confidence.
+- Note: Not to be confused with a temporary variable of the same name in
+  *benchmark_publisher/src/benchmark_publisher_node.cpp*.
+*/
 Eigen::Vector3d tmp_V;
+
+/*
+Most recent estimate of linear acceleration bias.
+- Relative to last body orientation.
+  - Actually, I think the assumption is that this is always relative to the
+    current body orientation.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+*/
 Eigen::Vector3d tmp_Ba;
+
+/*
+Most recent estimate of gyroscope bias. (I.e. angular velocity bias.)
+- Relative to last body orientation.
+  - Actually, I think the assumption is that this is always relative to the
+    current body orientation.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+*/
 Eigen::Vector3d tmp_Bg;
+
+/*
+Most recent IMU linear acceleration.
+- Raw data.
+- Relative to last body orientation.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+*/
+
 Eigen::Vector3d acc_0;
+/*
+Most recent IMU angular velocity.
+- Raw data.
+- Relative to last body orientation.
+- Modified in:
+  - `void predict(...)`.
+  - `void update(...)`.
+- Not to be confused with member variables of Estimator and IntegrationBase.
+*/
 Eigen::Vector3d gyr_0;
 
 queue<pair<cv::Mat, double>> image_buf;
@@ -64,29 +150,233 @@ Eigen::Matrix3d relocalize_r{Eigen::Matrix3d::Identity()};
 
 void predict(const sensor_msgs::ImuConstPtr &imu_msg)
 {
+    /* Extract timetamp and compute $dt$ since last data. */
     double t = imu_msg->header.stamp.toSec();
     double dt = t - latest_time;
+    /*
+    For clarity, this could be moved to the end of this function, where
+    `acc_0` and `gyr_0` are also updated.
+    */
     latest_time = t;
 
+    /* Extract reported raw linear acceleration. */
     double dx = imu_msg->linear_acceleration.x;
     double dy = imu_msg->linear_acceleration.y;
     double dz = imu_msg->linear_acceleration.z;
     Eigen::Vector3d linear_acceleration{dx, dy, dz};
 
+    /* Extract reported raw angular velocity. */
     double rx = imu_msg->angular_velocity.x;
     double ry = imu_msg->angular_velocity.y;
     double rz = imu_msg->angular_velocity.z;
     Eigen::Vector3d angular_velocity{rx, ry, rz};
 
+    /*
+    Order of operations:
+    - 1: Estimate local `un_acc_0`, the previous linear acceleration,
+      corrected for bias and gravity, in world-relative coordinates.
+      - This operation uses the previously-estimated body orientation `tmp_Q`,
+        so must occur before step 2, which updates `tmp_Q`.
+    - 2: Update global `tmp_Q`, the current estimated body orientation,
+      corrected for bias, in world-relative coordinates.
+    - 3: Estimate local `un_acc_1`, the current linear acceleration, corrected
+      for bias, in world-relative coordinates.
+      - This operation uses the updated orientation `tmp_Q`, estimated in step
+        2, so must occur after step 2.
+    - 4: Estimate local `un_acc`, the average linear acceleration since last
+      measurement, corrected for bias and gravity, in world-relative
+      coordinates.
+      - This uses `un_acc_0` and `un_acc_1`, estimated in steps 1 and 3
+        respectively, so must come after both.
+    - 5: Update global `tmp_P`, the current estimated position.
+      - This uses `un_acc`, estimated in step 4, so must come after step 4.
+      - This uses the previously-estimated velocity `tmp_V`, so must occur
+        before step 5, which updates `tmp_V`.
+    - 6: Update global `tmp_V`, the current estimated velocity.
+      - This uses `un_acc`, estimated in step 4, so must come after step 4.
+    */
+
+    /*
+    Estimate previous linear acceleration, corrected for bias and gravity, in
+    world-relative coordinates.
+
+    TODO@kaben: double-check this math.
+
+    global tmp_Q:
+    - Previous estimated body orientation, world-relative (check this?)
+    - In any case, serves to transform from body-relative to world-relative.
+
+    global acc_0:
+    - Previous IMU linear acceleration, raw.
+    - Relative to last body orientation.
+
+    global tmp_Ba:
+    - Previous estimated linear acceleration bias.
+    - Relative to last body orientation.
+    - NOTE@kaben: this is updated elsewhere, in `update()`. Depending upon
+      when this happens, it might be better to call this "latest estimate of
+      linear acceleration bias".
+
+    global estimator.g:
+    - Previous estimated gravity vector.
+    - World-relative.
+    - NOTE@kaben: It looks like estimator is updated in `send_imu(...)` via
+      `estimator.processIMU(...)`. Depending upon when this happens, it might
+      be better to call this "latest estimate of gravity vector".
+
+    tmp_Q.inverse():
+    - Transforms from world-relative to body-relative.
+
+    tmp_Q.inverse()*estimator.g:
+    - Previous estimated gravity vector.
+    - Relative to last body orientation.
+
+    acc_0 - tmp_Ba - tmp_Q.inverse()*estimator.g:
+    - Previous estimated linear acceleration, corrected for bias and gravity.
+    - Relative to last body orientation.
+
+    local un_acc_0 = tmp_Q * (acc_0 - tmp_Ba - tmp_Q.inverse()*estimator.g):
+    - Previous estimated linear acceleration, corrected for bias and gravity.
+    - World-relative.
+    */
     Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba - tmp_Q.inverse() * estimator.g);
 
+    /*
+    Estimate current body orientation, corrected for bias, in world-relative
+    coordinates.
+
+    TODO@kaben: double-check this math.
+
+    global gyr_0:
+    - Previous IMU angular velocity, raw.
+    - Relative to last body orientation.
+
+    local angular_velocity:
+    - Current IMU angular velocity, raw.
+    - Relative to last body orientation.
+
+    0.5 * (gyr_0 + angular_velocity):
+    - Average IMU angular velocity since last measurement.
+    - Relative to last body orientation.
+
+    global tmp_Bg:
+    - Previous estimated angular velocity bias.
+    - Relative to last body orientation.
+
+    local un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg:
+    - Estimated average IMU angular velocity since last measurement, corrected
+      for bias.
+    - Relative to last body orientation.
+
+    Utility::deltaQ(un_gyr * dt):
+    - Estimated change in body orientation since last measurement.
+    - Relative to last body orientation.
+
+    global tmp_Q:
+    - Previous estimated body orientation, world-relative (check this?)
+
+    global tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt):
+    - Current estimated body orientation, world-relative.
+    */
     Eigen::Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg;
     tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt);
 
+    /*
+    Estimate current linear acceleration, corrected for bias, in
+    world-relative coordinates.
+
+    TODO@kaben: double-check this math.
+
+    local linear_acceleration:
+    - Current IMU angular velocity, raw.
+    - Relative to current body orientation.
+
+    global tmp_Ba:
+    - Previous estimated linear acceleration bias.
+    - Technically, relative to last body orientation.
+    - I assume this is also a valid estimate relative to current body
+      orientation.
+    - NOTE@kaben: this is updated elsewhere, in `update()`. Depend upon when
+      this happens, it might be better to call this "latest estimate of linear
+      acceleration bias".
+
+    global estimator.g:
+    - Previous estimated gravity vector.
+    - World-relative.
+    - NOTE@kaben: It looks like estimator may be updated at end of this
+      function, via `estimator.processIMU(...)`.
+
+    global tmp_Q:
+    - Current estimated body orientation, world-relative.
+
+    tmp_Q.inverse():
+    - Transforms from world-relative to body-relative.
+
+    tmp_Q.inverse()*estimator.g:
+    - Previous estimated gravity vector.
+    - Relative to current body orientation.
+
+    linear_acceleration - tmp_Ba - tmp_Q.inverse() * estimator.g:
+    - Current estimated linear acceleration, corrected for bias and gravity.
+    - Relative to current body orientation.
+
+    local un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba - tmp_Q.inverse() * estimator.g):
+    - Current estimated linear acceleration, corrected for bias and gravity.
+    - World-relative.
+    */
     Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba - tmp_Q.inverse() * estimator.g);
 
+    /*
+    Estimate average linear acceleration since last measurement, corrected for
+    bias and gravity, in world-relative coordinates.
+
+    TODO@kaben: double-check this math.
+
+    local un_acc = 0.5 * (un_acc_0 + un_acc_1):
+    - Average estimated linear acceleration since last measurement, corrected
+      for bias and gravity.
+    - World-relative.
+    */
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
 
+    /*
+    Estimate current position and velocity.
+
+    0.5 * dt * dt * un_acc:
+    - Estimated change in position due to average acceleration since last
+      measurement.
+    - World-relative.
+
+    global tmp_P:
+    - Previous estimated position.
+    - World-relative. (Deduced: must be in same coordinate system as change in
+      position due to average acceleration, which is in world-relative
+      coordinates.)
+
+    global tmp_V:
+    - Previous estimated velocity.
+    - World-relative. (Deduced: must be in same coordinate system as change in
+      position due to average acceleration, which is in world-relative
+      coordinates.)
+
+    dt * tmp_V:
+    - Estimated change in position due to velocity since last measurement.
+    - World-relative. (Deduced: must be in same coordinate system as change in
+      position due to average acceleration, which is in world-relative
+      coordinates.)
+
+    global tmp_P = tmp_P + dt * tmp_V + 0.5 * dt * dt * un_acc:
+    - Current estimated position.
+    - World-relative.
+
+    dt * un_acc:
+    - Estimated change in velocity due to acceleration since last measurement.
+    - World-relative.
+
+    global tmp_V = tmp_V + dt * un_acc:
+    - Current estimated velocity.
+    - World-relative.
+    */
     tmp_P = tmp_P + dt * tmp_V + 0.5 * dt * dt * un_acc;
     tmp_V = tmp_V + dt * un_acc;
 
