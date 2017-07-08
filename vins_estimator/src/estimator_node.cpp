@@ -12,6 +12,8 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
+#include <soci.h>
+
 #include "estimator.h"
 #include "parameters.h"
 #include "utility/visualization.h"
@@ -98,7 +100,6 @@ Most recent estimate of linear acceleration bias.
   - Actually, I think the assumption is that this is always relative to the
     current body orientation.
 - Modified in:
-  - `void predict(...)`.
   - `void update(...)`.
 */
 Eigen::Vector3d tmp_Ba;
@@ -109,7 +110,6 @@ Most recent estimate of gyroscope bias. (I.e. angular velocity bias.)
   - Actually, I think the assumption is that this is always relative to the
     current body orientation.
 - Modified in:
-  - `void predict(...)`.
   - `void update(...)`.
 */
 Eigen::Vector3d tmp_Bg;
@@ -135,6 +135,17 @@ Most recent IMU angular velocity.
 */
 Eigen::Vector3d gyr_0;
 
+double previous_time;
+Eigen::Vector3d previous_angular_velocity;
+Eigen::Vector3d previous_linear_acceleration;
+Eigen::Vector3d previous_p;
+Eigen::Vector3d previous_v;
+Eigen::Quaterniond previous_q;
+int stamp_sec;
+int stamp_nsec;
+double dt;
+sensor_msgs::Imu raw_imu;
+
 queue<pair<cv::Mat, double>> image_buf;
 LoopClosure *loop_closure;
 KeyFrameDatabase keyframe_database;
@@ -148,11 +159,234 @@ Eigen::Vector3d relocalize_t{Eigen::Vector3d(0, 0, 0)};
 Eigen::Matrix3d relocalize_r{Eigen::Matrix3d::Identity()};
 
 
+soci::session main_sql;
+soci::session predict_sql;
+soci::statement *predict_sql_statement = nullptr;
+int predict_sql_transaction_size = 100;
+int predict_sql_run_count = 0;
+
 void predict(const sensor_msgs::ImuConstPtr &imu_msg)
 {
+    if(nullptr == predict_sql_statement){
+      predict_sql_statement = new soci::statement((
+        predict_sql.prepare << R"SQL(
+          INSERT INTO imu (
+            imu_timesstamp_sec
+          , imu_timesstamp_nsec
+
+          , imu_angular_velocity_x
+          , imu_angular_velocity_y
+          , imu_angular_velocity_z
+
+          , imu_linear_acceleration_x
+          , imu_linear_acceleration_y
+          , imu_linear_acceleration_z
+
+          , previous_time
+
+          , previous_angular_velocity_x
+          , previous_angular_velocity_y
+          , previous_angular_velocity_z
+
+          , previous_linear_acceleration_x
+          , previous_linear_acceleration_y
+          , previous_linear_acceleration_z
+
+          , previous_px
+          , previous_py
+          , previous_pz
+
+          , previous_vx
+          , previous_vy
+          , previous_vz
+
+          , previous_qw
+          , previous_qx
+          , previous_qy
+          , previous_qz
+
+          , bias_drx
+          , bias_dry
+          , bias_drz
+
+          , bias_dvx
+          , bias_dvy
+          , bias_dvz
+
+          , estimator_gx
+          , estimator_gy
+          , estimator_gz
+
+          , dt
+
+          , px
+          , py
+          , pz
+
+          , vx
+          , vy
+          , vz
+
+          , qw
+          , qx
+          , qy
+          , qz
+
+          ) VALUES (
+            :imu_timesstamp_sec
+          , :imu_timesstamp_nsec
+
+          , :imu_angular_velocity_x
+          , :imu_angular_velocity_y
+          , :imu_angular_velocity_z
+
+          , :imu_linear_acceleration_x
+          , :imu_linear_acceleration_y
+          , :imu_linear_acceleration_z
+
+          , :previous_time
+
+          , :previous_angular_velocity_x
+          , :previous_angular_velocity_y
+          , :previous_angular_velocity_z
+
+          , :previous_linear_acceleration_x
+          , :previous_linear_acceleration_y
+          , :previous_linear_acceleration_z
+
+          , :previous_px
+          , :previous_py
+          , :previous_pz
+
+          , :previous_vx
+          , :previous_vy
+          , :previous_vz
+
+          , :previous_qw
+          , :previous_qx
+          , :previous_qy
+          , :previous_qz
+
+          , :bias_drx
+          , :bias_dry
+          , :bias_drz
+
+          , :bias_dvx
+          , :bias_dvy
+          , :bias_dvz
+
+          , :estimator_gx
+          , :estimator_gy
+          , :estimator_gz
+
+          , :dt
+
+          , :px
+          , :py
+          , :pz
+
+          , :vx
+          , :vy
+          , :vz
+
+          , :qw
+          , :qx
+          , :qy
+          , :qz
+
+          )
+        )SQL"
+        , soci::use(raw_imu.header.stamp.sec)
+        , soci::use(raw_imu.header.stamp.nsec)
+
+        , soci::use(raw_imu.angular_velocity.x)
+        , soci::use(raw_imu.angular_velocity.y)
+        , soci::use(raw_imu.angular_velocity.z)
+
+        , soci::use(raw_imu.linear_acceleration.x)
+        , soci::use(raw_imu.linear_acceleration.y)
+        , soci::use(raw_imu.linear_acceleration.z)
+
+        , soci::use(previous_time)
+
+        , soci::use(previous_angular_velocity[0])
+        , soci::use(previous_angular_velocity[1])
+        , soci::use(previous_angular_velocity[2])
+
+        , soci::use(previous_linear_acceleration[0])
+        , soci::use(previous_linear_acceleration[1])
+        , soci::use(previous_linear_acceleration[2])
+
+        , soci::use(previous_p[0])
+        , soci::use(previous_p[1])
+        , soci::use(previous_p[2])
+
+        , soci::use(previous_v[0])
+        , soci::use(previous_v[1])
+        , soci::use(previous_v[2])
+
+        , soci::use(previous_q.w())
+        , soci::use(previous_q.x())
+        , soci::use(previous_q.y())
+        , soci::use(previous_q.z())
+
+        , soci::use(tmp_Bg[0])
+        , soci::use(tmp_Bg[1])
+        , soci::use(tmp_Bg[2])
+
+        , soci::use(tmp_Ba[0])
+        , soci::use(tmp_Ba[1])
+        , soci::use(tmp_Ba[2])
+
+        , soci::use(estimator.g[0])
+        , soci::use(estimator.g[1])
+        , soci::use(estimator.g[2])
+
+        , soci::use(dt)
+
+        , soci::use(tmp_P[0])
+        , soci::use(tmp_P[1])
+        , soci::use(tmp_P[2])
+
+        , soci::use(tmp_V[0])
+        , soci::use(tmp_V[1])
+        , soci::use(tmp_V[2])
+
+        , soci::use(tmp_Q.w())
+        , soci::use(tmp_Q.x())
+        , soci::use(tmp_Q.y())
+        , soci::use(tmp_Q.z())
+
+      ));
+    }
+
+    //ROS_DEBUG("predict count: %d", predict_sql_run_count++);
+    if(0 == ((predict_sql_run_count++) % predict_sql_transaction_size)){
+      if(predict_sql_transaction_size < predict_sql_run_count){
+        ROS_DEBUG("predict_sql.commit()");
+        predict_sql.commit();
+      }
+      ROS_DEBUG("predict_sql.begin()");
+      predict_sql.begin();
+    //} else {
+    //  ROS_DEBUG("not committing...");
+    }
+
+    raw_imu = *imu_msg;
+
+    previous_time = latest_time;
+    previous_angular_velocity = gyr_0;
+    previous_linear_acceleration = acc_0;
+    previous_p = tmp_P;
+    previous_v = tmp_V;
+    previous_q = tmp_Q;
+    stamp_sec = imu_msg->header.stamp.sec;
+    stamp_nsec = imu_msg->header.stamp.nsec;
+    
+
     /* Extract timetamp and compute $dt$ since last data. */
     double t = imu_msg->header.stamp.toSec();
-    double dt = t - latest_time;
+    dt = t - latest_time;
     /*
     For clarity, this could be moved to the end of this function, where
     `acc_0` and `gyr_0` are also updated.
@@ -382,6 +616,8 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
 
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity;
+
+    predict_sql_statement->execute(true);
 }
 
 void update()
@@ -865,6 +1101,78 @@ void process()
 
 int main(int argc, char **argv)
 {
+    main_sql.open("sqlite3://vins_capture.sqlite3");
+    main_sql << "DROP TABLE IF EXISTS imu;";
+    main_sql << R"SQL(
+      CREATE TABLE IF NOT EXISTS imu (
+        id INTEGER PRIMARY KEY
+
+      , imu_timesstamp_sec INTEGER
+      , imu_timesstamp_nsec INTEGER
+
+      , imu_angular_velocity_x DOUBLE
+      , imu_angular_velocity_y DOUBLE
+      , imu_angular_velocity_z DOUBLE
+
+      , imu_linear_acceleration_x DOUBLE
+      , imu_linear_acceleration_y DOUBLE
+      , imu_linear_acceleration_z DOUBLE
+
+      , previous_time DOUBLE
+
+      , previous_angular_velocity_x DOUBLE
+      , previous_angular_velocity_y DOUBLE
+      , previous_angular_velocity_z DOUBLE
+
+      , previous_linear_acceleration_x DOUBLE
+      , previous_linear_acceleration_y DOUBLE
+      , previous_linear_acceleration_z DOUBLE
+
+      , previous_px DOUBLE
+      , previous_py DOUBLE
+      , previous_pz DOUBLE
+
+      , previous_vx DOUBLE
+      , previous_vy DOUBLE
+      , previous_vz DOUBLE
+
+      , previous_qw DOUBLE
+      , previous_qx DOUBLE
+      , previous_qy DOUBLE
+      , previous_qz DOUBLE
+
+      , bias_drx DOUBLE
+      , bias_dry DOUBLE
+      , bias_drz DOUBLE
+
+      , bias_dvx DOUBLE
+      , bias_dvy DOUBLE
+      , bias_dvz DOUBLE
+
+      , estimator_gx DOUBLE
+      , estimator_gy DOUBLE
+      , estimator_gz DOUBLE
+
+      , dt DOUBLE
+
+      , px DOUBLE
+      , py DOUBLE
+      , pz DOUBLE
+
+      , vx DOUBLE
+      , vy DOUBLE
+      , vz DOUBLE
+
+      , qw DOUBLE
+      , qx DOUBLE
+      , qy DOUBLE
+      , qz DOUBLE
+      )
+    )SQL";
+    main_sql.close();
+
+    predict_sql.open("sqlite3://vins_capture.sqlite3");
+
     ros::init(argc, argv, "vins_estimator");
     ros::NodeHandle n("~");
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
@@ -891,6 +1199,16 @@ int main(int argc, char **argv)
         m_camera = CameraFactory::instance()->generateCameraFromYamlFile(CAM_NAMES);
     }
     ros::spin();
+
+    if(predict_sql_transaction_size < predict_sql_run_count){
+      ROS_INFO("predict_sql.commit()");
+      predict_sql.commit();
+    }
+    if(nullptr != predict_sql_statement){
+      delete predict_sql_statement;
+      predict_sql_statement = nullptr;
+    }
+    predict_sql.close();
 
     return 0;
 }

@@ -20,6 +20,17 @@ find_package(OpenCV REQUIRED)
 
 find_package(Ceres REQUIRED)
 
+find_path(
+  SOCI_INCLUDE_DIR
+  NAMES soci.h
+  PATH_SUFFIXES soci include/soci include
+)
+find_library(
+  SOCI_core_LIBRARY
+  NAMES soci_core
+)
+set(SOCI_LIBRARIES ${SOCI_core_LIBRARY})
+
 include_directories(${catkin_INCLUDE_DIRS} ${CERES_INCLUDE_DIRS})
 
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -27,6 +38,7 @@ find_package(Eigen3  REQUIRED)
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
+  ${SOCI_INCLUDE_DIR}
 )
 
 catkin_package()
@@ -61,6 +73,5 @@ add_executable(vins_estimator
     )
 
 
-target_link_libraries(vins_estimator ${catkin_LIBRARIES} ${OpenCV_LIBS} ${CERES_LIBRARIES}) 
-
+target_link_libraries(vins_estimator ${catkin_LIBRARIES} ${OpenCV_LIBS} ${CERES_LIBRARIES} ${SOCI_LIBRARIES})
 
